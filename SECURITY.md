@@ -10,17 +10,24 @@ issues in escape-sequence handling) are treated as security issues.
 
 What the project does continuously, enforced by required CI on every change:
 
-- **`unsafe` is confined to three audited single-line blocks** — `dup(2)`,
-  to open a second writer on the PTY master for the responder thread;
-  `File::from_raw_fd`, which takes sole ownership of that duplicate so it is
-  closed exactly once; and `kill(2)` behind `Terminal::signal`. They sit
-  under `SAFETY` comments (the first two share one) and each carries its own
-  `#[allow(unsafe_code)]`. The workspace sets `unsafe_code = "warn"` and CI
-  runs clippy with `-D warnings`, so a new block fails unless it carries
-  that `#[allow]` as well: the attribute is what review has to see, not a
-  count the lint keeps. None touches memory the child can influence.
-  Everything on the parsing path is pure Rust: escape sequences from the
-  child are parsed, never executed or evaluated.
+- **`unsafe` is confined to five audited blocks, all Unix-only.** Three
+  are single lines. `BorrowedFd::borrow_raw` borrows the PTY master's
+  descriptor, which std then duplicates, close-on-exec, into the responder
+  thread's second writer. `access(2)` resolves the program the way the PTY
+  layer does. `kill(2)` sits behind `Terminal::signal`. The fourth asks
+  `sigaction(2)` whether the kernel reaps this process's children. The
+  fifth is the `pre_exec` hook in `src/spawn.rs`, which runs in the forked
+  child before exec. It repeats portable-pty's own hook step by step, with
+  two changes: inherited descriptors are marked close-on-exec rather than
+  closed, so that a failed exec can be reported (#563), and the umask step
+  is left out because termlens never sets a umask. Each block sits under
+  its own `SAFETY` comment and carries its own `#[allow(unsafe_code)]`.
+  The workspace sets `unsafe_code = "warn"` and CI runs clippy with
+  `-D warnings`, so a new block fails unless it carries that `#[allow]` as
+  well: the attribute is what review has to see, not a count the lint
+  keeps. None touches memory the child can influence. Everything on the
+  parsing path is pure Rust: escape sequences from the child are parsed,
+  never executed or evaluated.
 - **Dependency policy** (`cargo-deny` job): RUSTSEC advisories, yanked
   crates, license allowlist, and crates.io-only sources — on every PR, with
   weekly grouped Dependabot updates and Dependabot alerts enabled.

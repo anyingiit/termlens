@@ -28,6 +28,7 @@ use crate::error::{Error, Result};
 use crate::keys::Input;
 use crate::keys::{mouse_legacy, mouse_sgr, mouse_utf8};
 use crate::screen::{MouseMode, Screen};
+use crate::spawn::{spawn_child, PtyChild};
 use crate::utf8::Utf8Sanitizer;
 use crate::wait::{next_backoff, Expired, Monitor, INITIAL_BACKOFF, POLL_CAP};
 
@@ -64,7 +65,7 @@ struct ExitWatch {
 impl ExitWatch {
     fn tick(
         &mut self,
-        child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+        child: &mut PtyChild,
         exit_status: &mut Option<ExitStatus>,
         state: &mut EmuState,
     ) {
@@ -254,15 +255,15 @@ static PTY_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 /// The lifecycle lock, held — or `None` on a platform with nothing to
 /// serialize. Callers hold and drop it the same way either way.
-type LifecycleGuard = Option<std::sync::MutexGuard<'static, ()>>;
+pub(crate) type LifecycleGuard = Option<std::sync::MutexGuard<'static, ()>>;
 
 #[cfg(unix)]
-fn pty_lifecycle_guard() -> LifecycleGuard {
+pub(crate) fn pty_lifecycle_guard() -> LifecycleGuard {
     Some(PTY_LIFECYCLE.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 #[cfg(not(unix))]
-fn pty_lifecycle_guard() -> LifecycleGuard {
+pub(crate) fn pty_lifecycle_guard() -> LifecycleGuard {
     None
 }
 
@@ -294,7 +295,7 @@ const PTY_OPEN_BACKOFF: Duration = Duration::from_millis(25);
 /// classifying an `anyhow` error by its text is guesswork, a permanent fault
 /// still reports its own message at the end, and the cost of being wrong is
 /// under two seconds on a spawn that was going to fail anyway.
-fn open_pty(size: PtySize) -> Result<(PtyPair, LifecycleGuard)> {
+pub(crate) fn open_pty(size: PtySize) -> Result<(PtyPair, LifecycleGuard)> {
     let pty = native_pty_system();
     let mut last = String::new();
     for attempt in 0..PTY_OPEN_ATTEMPTS {
@@ -324,21 +325,19 @@ type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 /// thread. `take_writer` may only be called once, so duplicate the
 /// descriptor instead: both refer to the same open file description,
 /// which is what we want — same terminal, independent blocking.
+///
+/// Close-on-exec, as std makes every descriptor it opens. A plain `dup` was
+/// inherited by every child the test process started while the terminal was
+/// alive, holding the master open in processes that have no business with
+/// it.
 #[cfg(unix)]
 fn dup_writer(master: &dyn portable_pty::MasterPty) -> Option<std::fs::File> {
-    use std::os::unix::io::FromRawFd;
-
     let fd = master.as_raw_fd()?;
-    // SAFETY: `fd` is the live master descriptor (the caller still owns
-    // the master). dup(2) returns a fresh descriptor we take sole
-    // ownership of; `File` closes it exactly once on drop.
+    // SAFETY: `fd` is the live master descriptor, owned by the master the
+    // caller holds for the whole of this borrow.
     #[allow(unsafe_code)]
-    let duped = unsafe { libc::dup(fd) };
-    if duped < 0 {
-        return None;
-    }
-    #[allow(unsafe_code)]
-    Some(unsafe { std::fs::File::from_raw_fd(duped) })
+    let master = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    master.try_clone_to_owned().ok().map(std::fs::File::from)
 }
 
 #[cfg(not(unix))]
@@ -1863,7 +1862,8 @@ impl TerminalBuilder {
     /// command (empty program name, missing
     /// [`current_dir`](Self::current_dir), a bare program name under
     /// [`env_clear`](Self::env_clear) with no `PATH` to resolve it) or the
-    /// program cannot be executed; [`Error::Size`] when the configured
+    /// program cannot be executed, with the reason the OS gave (on Unix a
+    /// missing `#!` interpreter is named); [`Error::Size`] when the configured
     /// [`size`](Self::size) has a dimension below 2 or past the
     /// 1000-per-axis limit; [`Error::Pty`] when the PTY cannot be opened.
     pub fn spawn(self, program: impl AsRef<OsStr>) -> Result<Terminal> {
@@ -1904,10 +1904,9 @@ impl TerminalBuilder {
             // `std::process::Command`, so it is made absolute here. Handed
             // over relative, the PTY layer joins it onto a relative program
             // path and the child then enters it before exec: `dir/./prog`
-            // looked up from inside `dir`, which does not exist. The exec
-            // failure could not even be reported, because the PTY layer
-            // closes the pipe std reports it through, so the child died of
-            // a runtime abort instead. `absolute` fails only on an empty
+            // looked up from inside `dir`, which does not exist. Until
+            // #563 that exec failure was not even reported: the child died
+            // of a runtime abort instead. `absolute` fails only on an empty
             // path or an unreadable cwd; the given path stands then.
             Some(dir) => cmd.cwd(std::path::absolute(dir).unwrap_or_else(|_| dir.clone())),
             None => {
@@ -1916,29 +1915,28 @@ impl TerminalBuilder {
                 }
             }
         }
-        if self.env_clear {
-            cmd.env_clear();
-        }
         // Whatever the child is told TERM is, XTGETTCAP's `TN` reports the
         // same string — an application must not be able to get two different
-        // answers to "which terminal is this?".
-        let term_name = self.envs.iter().find(|(k, _)| k == "TERM").map_or_else(
+        // answers to "which terminal is this?". Set twice, the later value is
+        // the one the child gets, so it is the one reported.
+        let term_name = self.envs.iter().rfind(|(k, _)| k == "TERM").map_or_else(
             || "xterm-256color".to_owned(),
             |(_, v)| v.to_string_lossy().into_owned(),
         );
+        // What the child gets on top of the inherited environment, or on top
+        // of nothing under env_clear. Later entries win.
+        let mut env: Vec<(OsString, OsString)> = Vec::new();
         if !self.envs.iter().any(|(k, _)| k == "TERM") {
-            cmd.env("TERM", "xterm-256color");
+            env.push(("TERM".into(), "xterm-256color".into()));
         }
         // The PTY layer fills SHELL from the host's login shell when the
         // variable is absent, which put one machine-shaped value inside an
         // environment env_clear promises is hermetic (#221). Pinned the way
         // TERM is; an explicit `.env("SHELL", …)` still wins.
         if self.env_clear && !self.envs.iter().any(|(k, _)| k == "SHELL") {
-            cmd.env("SHELL", "/bin/sh");
+            env.push(("SHELL".into(), "/bin/sh".into()));
         }
-        for (key, value) in &self.envs {
-            cmd.env(key, value);
-        }
+        env.extend(self.envs.iter().cloned());
 
         // Attach the reader thread BEFORE spawning the child: a program that
         // writes and exits within its first millisecond must find a drain
@@ -2064,10 +2062,11 @@ impl TerminalBuilder {
             })
             .map_err(Error::Io)?;
 
-        let child = pair.slave.spawn_command(cmd).map_err(|e| Error::Spawn {
-            command: command_desc.clone(),
-            reason: e.to_string(),
-        })?;
+        let child =
+            spawn_child(&pair, cmd, self.env_clear, &env).map_err(|reason| Error::Spawn {
+                command: command_desc.clone(),
+                reason,
+            })?;
         // Close the parent's slave handle so the master sees EOF once the
         // child (and its descendants) release the terminal.
         drop(pair.slave);
@@ -2556,7 +2555,7 @@ fn reader_loop(
 /// See the crate-level docs for a full example. Dropping a `Terminal` kills
 /// and reaps the child — tests never leak zombies, even on panic.
 pub struct Terminal {
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: PtyChild,
     // Option only so Drop can close it under the PTY lifecycle lock;
     // Some for the entire life of the value outside Drop.
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,

@@ -25,6 +25,10 @@ reads that marker.
   any line was read, so a 31-byte file declaring `65535x65535` made `termlens
   render` try to allocate 206 GB and abort. No termlens ever wrote a screen
   that large.
+- A coloured `termlens diff` no longer takes time quadratic in the number of
+  changed cells (#595). Painting checked each cell against the whole list of
+  changed cells, so a full-screen change on a large terminal took seconds
+  (8 s at 80,000 cells). The changed cells are now collected once.
 
 ## [0.11.6] - 2026-10-14
 

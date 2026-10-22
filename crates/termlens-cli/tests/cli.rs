@@ -129,6 +129,67 @@ fn diff_color_always_keeps_the_overlap_note_and_paints_the_rows() -> termlens::R
     Ok(())
 }
 
+/// Two 1000x1000 screens that differ in every cell. Painting used to ask
+/// the diff about each cell in turn, which took 8 s at 80,000 changed cells
+/// and would not finish here (#595).
+#[test]
+fn diff_color_always_paints_a_full_screen_change_quickly() {
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir().join(format!("termlens-big-diff-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let screen = |ch: char| {
+        let row = ch.to_string().repeat(1000);
+        format!(
+            "size: 1000x1000  cursor: 0,0\n{}\n",
+            vec![row; 1000].join("\n")
+        )
+    };
+    let (before, after, out) = (
+        dir.join("before.snap"),
+        dir.join("after.snap"),
+        dir.join("out"),
+    );
+    std::fs::write(&before, screen('a')).expect("write before");
+    std::fs::write(&after, screen('b')).expect("write after");
+
+    // The output is tens of megabytes, so it goes to a file rather than a
+    // pipe nobody drains while the test waits on the deadline.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_termlens"))
+        .args(["diff", "--color", "always"])
+        .arg(&before)
+        .arg(&after)
+        .stdout(std::fs::File::create(&out).expect("out file"))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn termlens");
+    // The exit is waited for on a thread of its own, so the deadline is a
+    // bounded wait on the exit itself rather than a polling sleep
+    // (CONTRIBUTING §3). On a regression the child is left to finish on its
+    // own; the test has already failed by then.
+    let (exited, exit) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = exited.send(child.wait());
+    });
+    let status = match exit.recv_timeout(Duration::from_secs(60)) {
+        Ok(status) => status.expect("wait for termlens"),
+        Err(_) => panic!("a coloured diff of two 1000x1000 screens took over 60 s"),
+    };
+    assert_eq!(status.code(), Some(1));
+    let printed = std::fs::read_to_string(&out).expect("read output");
+    assert!(
+        printed.contains("\x1b[31ma\x1b[0m"),
+        "the before side is painted red"
+    );
+    assert!(
+        printed.contains("\x1b[32mb\x1b[0m"),
+        "the after side is painted green"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `--color` with no WHEN used to print the raw Option — `None` when the
 /// flag ended the line, `Some("before.snap")` when it quietly ate the
 /// operand after it — internals that name neither the flag's requirement

@@ -2004,34 +2004,9 @@ fn inspect_reports_still_running_when_the_child_closes_its_terminal() -> termlen
     Ok(())
 }
 
-/// A stderr nobody reads any more — `termlens … 2>&1 | true` — made
-/// `eprintln!` panic, exit 101, outside the 0/1/2 the CLI promises (#594).
-/// The trailer cannot be delivered, so inspect says so with exit 2; a
-/// diagnostic that cannot be delivered keeps its exit 2.
-#[cfg(unix)]
-#[test]
-fn a_closed_stderr_is_exit_two_not_a_panic() -> termlens::Result<()> {
-    use std::process::{Command, Stdio};
-    let bin = env!("CARGO_BIN_EXE_termlens");
-    for args in [
-        &["inspect", "sh", "-c", "echo hi"][..],
-        &["--bogus"][..],
-        &["render", "--text", "missing.snap"][..],
-    ] {
-        let mut child = Command::new(bin)
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        // Close the read end before termlens writes anything to it.
-        drop(child.stderr.take());
-        let status = child.wait()?;
-        assert_eq!(status.code(), Some(2), "termlens {args:?}");
-    }
-    Ok(())
-}
-
-/// The same with a stderr that refuses every write: `2>/dev/full` (#594).
+/// A stderr that refuses every write, `2>/dev/full`, made `eprintln!`
+/// panic with exit 101 (#594). The closed-pipe case is in
+/// `closed_stderr.rs`, a binary of its own.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_full_stderr_is_exit_two_not_a_panic() -> termlens::Result<()> {
